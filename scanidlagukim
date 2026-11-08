@@ -1,0 +1,591 @@
+--[[
+	==========================================================
+	 NOW PLAYING - CLIENT ONLY (1 LocalScript, no server)
+	==========================================================
+	Letakkan di: StarterPlayer > StarterPlayerScripts > LocalScript
+	(atau StarterCharacterScripts kalau mau reset tiap respawn)
+
+	Semua jalan di sisi client:
+	- Scan semua objek Sound yang sudah direplikasi ke player ini
+	- Deteksi mana yang sedang diputar (IsPlaying == true)
+	- Ambil Asset ID dari SoundId ("rbxassetid://123456" -> 123456)
+	- Coba ambil nama lagu (MarketplaceService:GetProductInfo) + tabel nama manual
+	- Tampilkan panel "Now Playing" + tombol Copy ID
+	- Print ke Output juga
+
+	TIDAK butuh HttpService / RemoteEvent / ModuleScript.
+
+	Catatan: HttpService TIDAK bisa dipakai di LocalScript, jadi nama lagu
+	diambil dari GetProductInfo + tabel KnownNames yang bisa kamu isi sendiri.
+]]
+
+local Players = game:GetService("Players")
+local MarketplaceService = game:GetService("MarketplaceService")
+local SoundService = game:GetService("SoundService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ReplicatedFirst = game:GetService("ReplicatedFirst")
+
+local player = Players.LocalPlayer
+
+--==========================================================
+-- KONFIGURASI
+--==========================================================
+local CONFIG = {
+	PollInterval = 0.5,       -- seberapa sering cek (detik)
+	MinTimeLength = 5,        -- abaikan sound lebih pendek dari ini (detik). 0 = matikan
+	OnlySoundGroupName = nil, -- mis. "Music" kalau map pakai SoundGroup
+	PlayStrategy = "latest",  -- "latest" | "loudest" | "longest"
+
+	IgnoreNames = { Click = true, Hover = true, ButtonClick = true, Tick = true },
+
+	ShowGui = true,                          -- false = cuma print ke Output
+	ToggleKey = Enum.KeyCode.RightShift,     -- sembunyikan/tampilkan panel
+	ShowAllPlaying = true,                   -- print juga sound lain yang ikut bunyi
+
+	ResolveNames = true,                     -- coba ambil nama via GetProductInfo
+	RescanEvery = 60,                        -- full scan ulang tiap N poll (jaring pengaman)
+}
+
+-- Isi manual kalau nama dari GetProductInfo kosong/salah, contoh:
+-- [1834567890] = "Golden Hour - JVKE",
+local KnownNames = {
+	-- [1234567890] = "Judul Lagu",
+}
+
+--==========================================================
+-- API KECIL UNTUK KODE KAMU
+--==========================================================
+local listeners = {}
+local NowPlaying = {
+	current = nil, -- { assetId, name, soundName, path, volume, timeLength, timePosition }
+}
+
+-- Cara pakai:
+--   NowPlaying.Changed:Connect(function(info) print(info.assetId, info.name) end)
+--   print(NowPlaying:GetCurrentAssetId())
+NowPlaying.Changed = {
+	Connect = function(_, fn)
+		listeners[#listeners + 1] = fn
+		return {
+			Disconnect = function()
+				for i = #listeners, 1, -1 do
+					if listeners[i] == fn then
+						table.remove(listeners, i)
+					end
+				end
+			end,
+		}
+	end,
+}
+
+function NowPlaying:GetCurrent()
+	return self.current
+end
+
+function NowPlaying:GetCurrentAssetId()
+	return self.current and self.current.assetId or nil
+end
+
+function NowPlaying:GetCurrentSoundId()
+	local id = NowPlaying:GetCurrentAssetId()
+	return id and ("rbxassetid://" .. id) or nil
+end
+
+_G.NowPlaying = NowPlaying -- biar bisa diakses dari script lain di client yang sama
+
+--==========================================================
+-- UTIL
+--==========================================================
+local function extractAssetId(soundId)
+	if type(soundId) ~= "string" then
+		return nil
+	end
+	local id = string.match(soundId, "rbxassetid://(%d+)")
+		or string.match(soundId, "[?&]id=(%d+)")
+		or string.match(soundId, "^%s*(%d+)%s*$")
+	return id and tonumber(id) or nil
+end
+
+local function isPlaying(sound)
+	local ok, value = pcall(function()
+		return sound.IsPlaying
+	end)
+	return ok and value == true
+end
+
+local function isCandidate(sound)
+	if not sound:IsA("Sound") then
+		return false
+	end
+	if CONFIG.IgnoreNames[sound.Name] then
+		return false
+	end
+	if CONFIG.OnlySoundGroupName then
+		local group = sound.SoundGroup
+		if not group or group.Name ~= CONFIG.OnlySoundGroupName then
+			return false
+		end
+	end
+	if extractAssetId(sound.SoundId) == nil then
+		return false
+	end
+	if CONFIG.MinTimeLength > 0 then
+		local ok, length = pcall(function()
+			return sound.TimeLength
+		end)
+		if ok and length > 0 and length < CONFIG.MinTimeLength then
+			return false
+		end
+	end
+	return true
+end
+
+local function getScanRoots()
+	local roots = { Workspace, SoundService, Lighting, ReplicatedStorage, ReplicatedFirst }
+	if player then
+		local playerGui = player:FindFirstChildOfClass("PlayerGui")
+		if playerGui then
+			table.insert(roots, playerGui)
+		end
+	end
+	return roots
+end
+
+--==========================================================
+-- NAMA LAGU
+--==========================================================
+local nameCache = {}
+local pendingNames = {}
+
+local function requestName(assetId, callback)
+	if not assetId then
+		return
+	end
+
+	if KnownNames[assetId] then
+		nameCache[assetId] = KnownNames[assetId]
+	end
+	if nameCache[assetId] then
+		callback(nameCache[assetId])
+		return
+	end
+
+	if not CONFIG.ResolveNames or pendingNames[assetId] then
+		return
+	end
+	pendingNames[assetId] = true
+
+	task.spawn(function()
+		local ok, info = pcall(function()
+			return MarketplaceService:GetProductInfo(assetId, Enum.InfoType.Asset)
+		end)
+		pendingNames[assetId] = nil
+
+		if ok and type(info) == "table" and type(info.Name) == "string" and info.Name ~= "" then
+			nameCache[assetId] = info.Name
+			callback(info.Name)
+		end
+	end)
+end
+
+--==========================================================
+-- REGISTRI SOUND (biar nggak scan GetDescendants tiap 0.5 detik)
+--==========================================================
+local registry = {} -- [Sound] = true
+
+local function addSound(sound)
+	if registry[sound] or not sound:IsA("Sound") then
+		return
+	end
+	registry[sound] = true
+	sound.Destroying:Connect(function()
+		registry[sound] = nil
+	end)
+end
+
+local function fullScan()
+	for _, root in ipairs(getScanRoots()) do
+		for _, descendant in ipairs(root:GetDescendants()) do
+			if descendant:IsA("Sound") then
+				addSound(descendant)
+			end
+		end
+	end
+end
+
+local function hookRoots()
+	for _, root in ipairs(getScanRoots()) do
+		root.DescendantAdded:Connect(function(descendant)
+			if descendant:IsA("Sound") then
+				addSound(descendant)
+			end
+		end)
+	end
+end
+
+--==========================================================
+-- GUI
+--==========================================================
+local gui, panel, titleLabel, idBox, metaLabel, copyButton, header, statusDot
+
+local function buildGui()
+	local playerGui = player:WaitForChild("PlayerGui")
+
+	local screenGui = Instance.new("ScreenGui")
+	screenGui.Name = "NowPlayingClientGui"
+	screenGui.ResetOnSpawn = false
+	screenGui.IgnoreGuiInset = true
+	screenGui.DisplayOrder = 60
+	screenGui.Parent = playerGui
+	gui = screenGui
+
+	panel = Instance.new("Frame")
+	panel.Name = "Panel"
+	panel.AnchorPoint = Vector2.new(0.5, 0)
+	panel.Position = UDim2.new(0.5, 0, 0, 12)
+	panel.Size = UDim2.fromOffset(330, 80)
+	panel.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
+	panel.BackgroundTransparency = 0.12
+	panel.BorderSizePixel = 0
+	panel.Visible = false
+	panel.Parent = screenGui
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 10)
+	corner.Parent = panel
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(80, 220, 160)
+	stroke.Thickness = 1
+	stroke.Transparency = 0.35
+	stroke.Parent = panel
+
+	local padding = Instance.new("UIPadding")
+	padding.PaddingLeft = UDim.new(0, 12)
+	padding.PaddingRight = UDim.new(0, 12)
+	padding.PaddingTop = UDim.new(0, 10)
+	padding.PaddingBottom = UDim.new(0, 10)
+	padding.Parent = panel
+
+	statusDot = Instance.new("Frame")
+	statusDot.Name = "Dot"
+	statusDot.Position = UDim2.fromOffset(0, 4)
+	statusDot.Size = UDim2.fromOffset(6, 6)
+	statusDot.BackgroundColor3 = Color3.fromRGB(80, 220, 160)
+	statusDot.BorderSizePixel = 0
+	statusDot.Parent = panel
+
+	local dotCorner = Instance.new("UICorner")
+	dotCorner.CornerRadius = UDim.new(1, 0)
+	dotCorner.Parent = statusDot
+
+	header = Instance.new("TextLabel")
+	header.Position = UDim2.fromOffset(12, 0)
+	header.Size = UDim2.new(1, -12, 0, 14)
+	header.BackgroundTransparency = 1
+	header.Font = Enum.Font.GothamBold
+	header.TextSize = 11
+	header.TextXAlignment = Enum.TextXAlignment.Left
+	header.TextColor3 = Color3.fromRGB(80, 220, 160)
+	header.Text = "SEDANG DIPUTAR"
+	header.Parent = panel
+
+	titleLabel = Instance.new("TextLabel")
+	titleLabel.Position = UDim2.fromOffset(0, 18)
+	titleLabel.Size = UDim2.new(1, 0, 0, 20)
+	titleLabel.BackgroundTransparency = 1
+	titleLabel.Font = Enum.Font.GothamBold
+	titleLabel.TextSize = 15
+	titleLabel.TextTruncate = Enum.TextTruncate.AtEnd
+	titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+	titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+	titleLabel.Text = "-"
+	titleLabel.Parent = panel
+
+	idBox = Instance.new("TextBox")
+	idBox.Position = UDim2.fromOffset(0, 46)
+	idBox.Size = UDim2.new(1, -74, 0, 24)
+	idBox.BackgroundColor3 = Color3.fromRGB(38, 38, 48)
+	idBox.BorderSizePixel = 0
+	idBox.ClearTextOnFocus = false
+	idBox.TextEditable = false
+	idBox.Font = Enum.Font.Code
+	idBox.TextSize = 13
+	idBox.TextXAlignment = Enum.TextXAlignment.Left
+	idBox.PlaceholderText = "tidak ada suara"
+	idBox.Text = ""
+	idBox.Parent = panel
+
+	local idPadding = Instance.new("UIPadding")
+	idPadding.PaddingLeft = UDim.new(0, 8)
+	idPadding.Parent = idBox
+
+	local idCorner = Instance.new("UICorner")
+	idCorner.CornerRadius = UDim.new(0, 6)
+	idCorner.Parent = idBox
+
+	copyButton = Instance.new("TextButton")
+	copyButton.AnchorPoint = Vector2.new(1, 0)
+	copyButton.Position = UDim2.new(1, 0, 0, 46)
+	copyButton.Size = UDim2.fromOffset(68, 24)
+	copyButton.BackgroundColor3 = Color3.fromRGB(80, 220, 160)
+	copyButton.BorderSizePixel = 0
+	copyButton.Font = Enum.Font.GothamBold
+	copyButton.TextSize = 12
+	copyButton.TextColor3 = Color3.fromRGB(15, 30, 22)
+	copyButton.Text = "Copy ID"
+	copyButton.Parent = panel
+
+	local copyCorner = Instance.new("UICorner")
+	copyCorner.CornerRadius = UDim.new(0, 6)
+	copyCorner.Parent = copyButton
+
+	metaLabel = Instance.new("TextLabel")
+	metaLabel.AnchorPoint = Vector2.new(1, 0)
+	metaLabel.Size = UDim2.fromOffset(150, 14)
+	metaLabel.Position = UDim2.new(1, 0, 0, 0)
+	metaLabel.BackgroundTransparency = 1
+	metaLabel.Font = Enum.Font.Gotham
+	metaLabel.TextSize = 10
+	metaLabel.TextXAlignment = Enum.TextXAlignment.Right
+	metaLabel.TextColor3 = Color3.fromRGB(150, 150, 165)
+	metaLabel.Text = ""
+	metaLabel.Parent = panel
+
+	copyButton.MouseButton1Click:Connect(function()
+		local id = NowPlaying:GetCurrentAssetId()
+		if not id then
+			return
+		end
+		local copied = false
+		if typeof(setclipboard) == "function" then
+			copied = select(1, pcall(setclipboard, tostring(id)))
+		end
+		if copied then
+			copyButton.Text = "Copied!"
+		else
+			idBox:CaptureFocus()
+			idBox.SelectionStart = 1
+			idBox.CursorPosition = #idBox.Text + 1
+			copyButton.Text = "Ctrl+C"
+		end
+		task.delay(1.2, function()
+			if copyButton then
+				copyButton.Text = "Copy ID"
+			end
+		end)
+	end)
+end
+
+local function formatTime(seconds)
+	seconds = math.max(0, math.floor(seconds or 0))
+	return string.format("%d:%02d", math.floor(seconds / 60), seconds % 60)
+end
+
+local function render(info)
+	if not CONFIG.ShowGui or not panel then
+		return
+	end
+
+	if info and info.assetId then
+		panel.Visible = gui.Enabled
+		titleLabel.Text = info.name or info.soundName or "Lagu tanpa nama"
+		idBox.Text = "rbxassetid://" .. tostring(info.assetId)
+		if info.timeLength and info.timeLength > 0 then
+			metaLabel.Text = formatTime(info.timePosition) .. " / " .. formatTime(info.timeLength)
+		else
+			metaLabel.Text = ""
+		end
+	else
+		panel.Visible = false
+	end
+end
+
+--==========================================================
+-- POLLING
+--==========================================================
+local startTick = 0
+local wasPlaying = {}  -- [Sound] = true
+local startTicks = {}  -- [Sound] = tick saat mulai diputar
+
+local function makeSnapshot(sound, entry)
+	local volume, length, position = 0, 0, 0
+	pcall(function()
+		volume = sound.Volume
+		length = sound.TimeLength
+		position = sound.TimePosition
+	end)
+	return {
+		assetId = entry.assetId,
+		name = nameCache[entry.assetId] or KnownNames[entry.assetId],
+		soundName = sound.Name,
+		path = sound:GetFullName(),
+		volume = volume,
+		timeLength = length,
+		timePosition = position,
+		sound = sound,
+	}
+end
+
+local current = nil
+local lastPrintedId = nil
+
+local function poll()
+	startTick = startTick + 1
+
+	local active = {}
+
+	for sound in pairs(registry) do
+		if sound.Parent == nil then
+			registry[sound] = nil
+			wasPlaying[sound] = nil
+			startTicks[sound] = nil
+		else
+			local playing = isPlaying(sound)
+			if playing and not wasPlaying[sound] then
+				wasPlaying[sound] = true
+				startTicks[sound] = startTick
+			elseif not playing then
+				wasPlaying[sound] = false
+			end
+
+			if playing and isCandidate(sound) then
+				local assetId = extractAssetId(sound.SoundId)
+				if assetId then
+					local entry = { assetId = assetId }
+
+					-- minta nama kalau belum ada (sekali per ID)
+					if CONFIG.ResolveNames and not nameCache[assetId] then
+						requestName(assetId, function(name)
+							-- update tampilan kalau lagu ini masih yang aktif
+							if current and current.assetId == assetId then
+								current.name = name
+								render(current)
+							end
+						end)
+					end
+
+					local snapshot = makeSnapshot(sound, entry)
+					local tickValue = startTicks[sound] or 0
+
+					active[#active + 1] = { snapshot = snapshot, tick = tickValue }
+				end
+			end
+		end
+	end
+
+	-- pilih lagu utama
+	local best, bestScore = nil, -math.huge
+	for _, item in ipairs(active) do
+		local score
+		if CONFIG.PlayStrategy == "loudest" then
+			score = item.snapshot.volume
+		elseif CONFIG.PlayStrategy == "longest" then
+			score = item.snapshot.timeLength
+		else
+			score = item.tick
+		end
+		if score > bestScore then
+			best, bestScore = item, score
+		end
+	end
+
+	local chosen = best and best.snapshot or nil
+	local sameAsBefore = current
+		and chosen
+		and current.sound == chosen.sound
+		and current.assetId == chosen.assetId
+
+	if not sameAsBefore then
+		current = chosen
+		NowPlaying.current = chosen
+
+		render(chosen)
+
+		-- print ke Output
+		if chosen then
+			if chosen.assetId ~= lastPrintedId then
+				lastPrintedId = chosen.assetId
+				print(string.format(
+					"[NowPlaying] %s | ID: %d | rbxassetid://%d | %s",
+					chosen.name or "(nama belum diketahui)",
+					chosen.assetId,
+					chosen.assetId,
+					chosen.path
+				))
+				if CONFIG.ShowAllPlaying then
+					for i, item in ipairs(active) do
+						if item.snapshot.sound ~= chosen.sound then
+							print(string.format(
+								"             + juga berbunyi: %s (ID: %d)",
+								item.snapshot.name or item.snapshot.soundName,
+								item.snapshot.assetId
+							))
+						end
+					end
+				end
+			end
+		else
+			lastPrintedId = nil
+			print("[NowPlaying] Tidak ada lagu yang diputar.")
+		end
+
+		for _, fn in ipairs(listeners) do
+			pcall(fn, chosen)
+		end
+	end
+end
+
+--==========================================================
+-- START
+--==========================================================
+if CONFIG.ShowGui then
+	task.spawn(buildGui)
+end
+
+fullScan()
+hookRoots()
+
+task.spawn(function()
+	local counter = 0
+	while true do
+		counter = counter + 1
+		if counter % math.max(1, CONFIG.RescanEvery) == 0 then
+			fullScan()
+		end
+		local ok, err = pcall(poll)
+		if not ok then
+			warn("[NowPlaying] poll error: " .. tostring(err))
+		end
+		task.wait(CONFIG.PollInterval)
+	end
+end)
+
+-- Toggle panel
+UserInputService.InputBegan:Connect(function(input, processed)
+	if processed or not CONFIG.ShowGui or not gui then
+		return
+	end
+	if input.KeyCode == CONFIG.ToggleKey then
+		if gui.Enabled then
+			gui.Enabled = false
+		else
+			gui.Enabled = true
+			render(current)
+		end
+	end
+end)
+
+-- Kalau ada Sound yang dibuat di dalam PlayerGui setelah GUI jadi
+player.ChildAdded:Connect(function(child)
+	if child:IsA("PlayerGui") then
+		for _, descendant in ipairs(child:GetDescendants()) do
+			if descendant:IsA("Sound") then
+				addSound(descendant)
+			end
+		end
+	end
+end)
